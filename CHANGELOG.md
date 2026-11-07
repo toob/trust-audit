@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 - unreleased (MIT licensed)
+## 0.1.0 - 2026-11-07 (MIT licensed)
 
 First version: read-only, offline audit of CA trust stores against a fingerprint list built from
 Mozilla's removed / distrust-after roots and the eMudhra 2026 incident; host, container image
@@ -8,5 +8,5 @@ Mozilla's removed / distrust-after roots and the eMudhra 2026 incident; host, co
 carries one or more reference links; `sources/curated.tsv` links fingerprints to DigiNotar,
 TURKTRUST, ANSSI, CNNIC, WoSign/StartCom, Camerfirma, TrustCor and DarkMatter. PowerShell edition
 (`trust-audit.ps1`) for Windows; identical files are fingerprinted once. NSS databases (Chrome's
-shared `nssdb`, Firefox/Thunderbird profiles) are read through `certutil`. The report shows a store table, then each finding once with all
-stores holding it; colour on a terminal, `-q` / `-Quiet` for a short form.
+shared `nssdb`, Firefox/Thunderbird profiles) are read through `certutil`. The report shows a store table, then each finding once with all stores
+holding it; colour on a terminal, `-q` / `-Quiet` for a short form.
