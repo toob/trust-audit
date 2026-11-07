@@ -1,0 +1,633 @@
+#!/bin/sh
+# trust-audit - list the CA certificates that should no longer be trusted but are
+# still present in this machine's (or an unpacked image's) trust stores.
+#
+# Read-only and offline: it only reads files and runs a few local commands to
+# locate and read stores (openssl, python3, keytool, certutil, security). It writes nothing, not even
+# temporary files, and never touches the network. See README.md for exactly what
+# is, and is not, covered.
+#
+# Exit status: 0 clean · 1 distrusted certificate(s) found · 2 cannot run / bad usage
+#              3 nothing found but some store could not be read (NOT a clean result)
+
+VERSION=0.1.0
+LC_ALL=C
+export LC_ALL
+set -u
+DEFIFS=$IFS
+
+here=$(cd "$(dirname "$0")" && pwd)
+LIST=$here/distrusted.tsv
+STALE_DAYS=90
+
+# Public self-test certificate (ISRG Root X2) and its SHA-256, published by Mozilla's CCADB.
+SELFTEST_FP=69729B8E15A86EFC177A57AFB7171DFC64ADD28C2FCA8CF1507E34453CCB1470
+SELFTEST_PEM='-----BEGIN CERTIFICATE-----
+MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw
+CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg
+R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00
+MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT
+ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw
+EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW
++1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9
+ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T
+AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI
+zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW
+tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1
+/q4AaOeMSQ+2b1tbFfLn
+-----END CERTIFICATE-----'
+
+usage() {
+  cat <<'EOF'
+Usage: trust-audit [options] [FILE|DIR ...]
+
+Audits the CA trust stores of this machine; FILE/DIR arguments (PEM bundle, or a
+directory of PEM files) are audited too.
+
+  -r ROOT   audit an unpacked container image / mounted filesystem rooted at ROOT
+            instead of this host: no environment or host runtime is consulted, symbolic
+            links are followed inside ROOT, and FILE/DIR/-f paths are paths inside it
+  -f DIR    also search the tree DIR for bundle files by name (repeatable)
+  -n        audit only what is named (arguments, -f), not the default locations
+  -k KINDS  comma-separated kinds to report: compromised,removed,partial (default: all)
+  -q        quiet: only stores with a problem and one line per finding
+  -l LIST   fingerprint list to use (default: distrusted.tsv next to this script)
+  -V        print the version      -h  print this help
+EOF
+}
+
+die() { echo "trust-audit: $*" >&2; exit 2; }
+
+# ---------------------------------------------------------------- arguments
+ROOT=
+ROOTMODE=0
+FINDS=
+DEFAULTS=1
+QUIET=0
+KINDS=compromised,removed,partial
+while getopts 'hVnqr:f:k:l:' opt; do
+  case $opt in
+    h) usage; exit 0 ;;
+    V) echo "trust-audit $VERSION"; exit 0 ;;
+    n) DEFAULTS=0 ;;
+    q) QUIET=1 ;;
+    r) [ -d "$OPTARG" ] || die "-r: not a directory: $OPTARG"; ROOT=${OPTARG%/}; ROOTMODE=1 ;;
+    f) FINDS=$FINDS$OPTARG
+       FINDS=$FINDS'
+' ;;
+    k) KINDS=$OPTARG ;;
+    l) LIST=$OPTARG ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+case ",$KINDS," in *,,*) die "-k: empty kind" ;; esac
+IFS=,
+for k in $KINDS; do
+  case $k in compromised | removed | partial) ;; *) die "-k: unknown kind '$k'" ;; esac
+done
+IFS=$DEFIFS
+
+# ------------------------------------------------------------- dependencies
+for c in openssl awk sed tr sort cksum cat date; do
+  command -v "$c" >/dev/null 2>&1 || die "required command not found: $c"
+done
+[ -z "$FINDS" ] || command -v find >/dev/null 2>&1 || die "-f needs find"
+[ "$ROOTMODE" = 0 ] || command -v readlink >/dev/null 2>&1 || die "-r needs readlink"
+
+
+# Colours only on a terminal (and never with NO_COLOR); progress only on a terminal's stderr.
+TAB=$(printf '\t')
+ESC=$(printf '\033')
+COLOR=0 PROG=0
+if [ "${TERM:-dumb}" != dumb ]; then
+  [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && COLOR=1
+  [ -t 2 ] && PROG=1
+fi
+progress() { [ "$PROG" = 1 ] && printf '\r%s[K  reading %s' "$ESC" "$1" >&2; return 0; }
+
+# ----------------------------------------------------------- PEM -> fingerprints
+# Reads the given files (stdin when none). Sets, for the certificates found:
+#   fps      sorted unique SHA-256 fingerprints (upper-case hex, one per line)
+#   nblocks  distinct certificate blocks seen      nfps    blocks that openssl fingerprinted
+#   nfiles   files read                            nnopem  files without any certificate
+# nblocks > nfps means some certificate could not be parsed: the caller must say so.
+collect() {
+  raw=$(awk '
+    BEGIN { cmd = "openssl x509 -noout -fingerprint -sha256 2>/dev/null" }
+    FNR == 1 { if (nfiles > 0 && !hit) nopem++; nfiles++; hit = 0 }
+    { sub(/\r$/, "") }
+    /^-----BEGIN [A-Z0-9 ]*CERTIFICATE-----[ \t]*$/ { inb = 1; blk = "" }
+    inb { blk = blk $0 "\n" }
+    /^-----END [A-Z0-9 ]*CERTIFICATE-----[ \t]*$/ && inb {
+      inb = 0; hit = 1
+      if (!(blk in seen)) { seen[blk] = 1; nblocks++; printf "%s", blk | cmd; close(cmd) }
+    }
+    END { if (nfiles > 0 && !hit) nopem++
+          print "#BLOCKS " nblocks + 0; print "#FILES " nfiles + 0; print "#NOPEM " nopem + 0 }' "$@") ||
+    return 1
+  fps=$(printf '%s\n' "$raw" | sed -n 's/^.*Fingerprint=//p' | sed 's/://g' | tr 'a-f' 'A-F' |
+    awk 'length($0) == 64 && $0 !~ /[^0-9A-F]/' | sort)
+  nfps=$(printf '%s\n' "$fps" | awk 'NF { n++ } END { print n + 0 }')
+  fps=$(printf '%s\n' "$fps" | sort -u)
+  nblocks=$(printf '%s\n' "$raw" | sed -n 's/^#BLOCKS //p')
+  nfiles=$(printf '%s\n' "$raw" | sed -n 's/^#FILES //p')
+  nnopem=$(printf '%s\n' "$raw" | sed -n 's/^#NOPEM //p')
+  return 0
+}
+
+# ---------------------------------------------------------- self-test, list
+collect <<EOF
+$SELFTEST_PEM
+EOF
+if [ "$fps" != "$SELFTEST_FP" ] || [ "$nblocks" != 1 ] || [ "$nfps" != 1 ]; then
+  die "self-test failed: this openssl ($(openssl version 2>&1)) does not fingerprint a known certificate correctly"
+fi
+
+[ -r "$LIST" ] || die "cannot read the fingerprint list: $LIST"
+nlist=$(awk -F'\t' '
+  /^#/ || /^$/ { next }
+  { nr = split($5, r, " "); badref = 0; for (j = 1; j <= nr; j++) if (r[j] !~ /^https?:\/\/[^ ]+$/) badref = 1 }
+  NF != 5 || length($1) != 64 || $1 ~ /[^0-9A-F]/ || ($2 != "compromised" && $2 != "removed" && $2 != "partial") || badref {
+    printf "trust-audit: %s: line %d is malformed\n", FILENAME, NR > "/dev/stderr"; bad = 1; exit }
+  { n++ }
+  END { if (bad) exit 1; print n + 0 }' "$LIST") || exit 2
+[ "$nlist" -gt 0 ] || die "$LIST holds no fingerprint"
+epoch=$(sed -n 's/^# generated=[0-9-]* epoch=\([0-9]*\).*/\1/p' "$LIST" | head -n 1)
+gendate=$(sed -n 's/^# generated=\([0-9-]*\) .*/\1/p' "$LIST" | head -n 1)
+
+notes=
+note() { notes=$notes$*'
+'; }
+
+echo "trust-audit $VERSION - list of $nlist fingerprints (generated ${gendate:-unknown})"
+if [ -z "$epoch" ]; then
+  note "the fingerprint list carries no date: cannot tell how stale it is"
+else
+  age=$(($(date +%s) - epoch))
+  [ "$age" -gt $((STALE_DAYS * 86400)) ] &&
+    note "the fingerprint list is $((age / 86400)) days old: refresh it (update-list) and re-run"
+fi
+
+# ------------------------------------------------------------------ checking
+found=0 incomplete=0 nstores=0 nhits=0 sigs='' paths='' filesums=''
+
+# Results are collected, then printed together at the end (see "report output").
+#   rows      one line per store: STATUS TAB name TAB certificates TAB note
+#   findings  one line per listed certificate found in a store: fingerprint TAB kind TAB store
+#   xnote     extra note for the next row (set by the scanners)
+rows='' findings='' xnote=''
+row() { # STATUS NAME COUNT NOTE
+  rows="$rows$1$TAB$2$TAB$3$TAB$4
+"
+}
+
+# report NAME : verdict for the certificates currently held in fps/nblocks/nfps.
+report() {
+  name=$1 note=$xnote xnote=
+  if [ "$nblocks" -eq 0 ]; then
+    row SKIP "$name" 0 "no certificate found${note:+; $note}"
+    incomplete=1
+    return
+  fi
+  warn=0
+  if [ "$nfps" -ne "$nblocks" ]; then
+    note="$((nblocks - nfps)) of $nblocks certificate(s) could not be fingerprinted - this store is NOT fully audited${note:+; $note}"
+    warn=1 incomplete=1
+  fi
+  [ "$nnopem" -gt 0 ] && [ "$nfiles" -gt 1 ] && note="${note:+$note; }$nnopem of $nfiles files held no PEM certificate and were skipped"
+  sig=$(printf '%s\n' "$fps" | cksum)
+  case "$sigs" in
+    *"|$sig="*)
+      prior=${sigs#*"|$sig="}
+      st=same; [ "$warn" = 1 ] && st=WARN
+      row "$st" "$name" "$nblocks" "identical set to ${prior%%|*}, already audited above${note:+; $note}"
+      return ;;
+  esac
+  nstores=$((nstores + 1))
+  sigs="$sigs|$sig=$name|"
+  hits=$(printf '%s\n' "$fps" | awk -F'\t' -v kinds=",$KINDS," '
+    FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF == 5 && index(kinds, "," $2 ",")) kind[$1] = $2; next }
+    $0 in kind { print $0 "\t" kind[$0] }' "$LIST" -) ||
+    { row WARN "$name" "$nblocks" "internal error while checking against the list"; incomplete=1; return; }
+  if [ -n "$hits" ]; then
+    found=1 nhits=$((nhits + 1))
+    nh=$(printf '%s\n' "$hits" | awk 'END { print NR }')
+    findings="$findings$(printf '%s\n' "$hits" | awk -F'\t' -v s="$name" -v t="$TAB" '{ print $1 t $2 t s }')
+"
+    row FOUND "$name" "$nblocks" "$nh listed${note:+; $note}"
+  elif [ "$warn" = 1 ]; then
+    row WARN "$name" "$nblocks" "$note"
+  else
+    row ok "$name" "$nblocks" "$note"
+  fi
+}
+
+not_scanned() { # NAME REASON
+  row SKIP "$1" "" "NOT SCANNED - $2"
+  incomplete=1
+}
+
+# Root mode: an image's symbolic links must be read inside the image, as a chroot would: an
+# absolute link is re-based onto ROOT and ".." cannot climb above it. Nothing is ever read
+# from the host by accident (that would audit the wrong machine and report it as the image).
+rootresolve() { # PATH under ROOT -> same path with every symbolic link followed inside ROOT
+  cur=$ROOT hops=0
+  rest=${1#"$ROOT"}
+  rest=${rest#/}
+  while [ -n "$rest" ]; do
+    comp=${rest%%/*}
+    case $rest in */*) rest=${rest#*/} ;; *) rest= ;; esac
+    case $comp in
+      '' | .) continue ;;
+      ..) cur=${cur%/*}; [ "${#cur}" -lt "${#ROOT}" ] && cur=$ROOT; continue ;;
+    esac
+    cur=$cur/$comp
+    if [ -L "$cur" ]; then
+      hops=$((hops + 1))
+      [ "$hops" -gt 40 ] && return 1
+      lt=$(readlink "$cur") || return 1
+      case $lt in
+        /*) cur=$ROOT rest=${lt#/}${rest:+/$rest} ;;
+        *) cur=${cur%/*} rest=$lt${rest:+/$rest} ;;
+      esac
+    fi
+  done
+  printf '%s\n' "$cur"
+}
+resolve() { # PATH -> $real (the path to read), or fail with $why
+  real=$1
+  [ "$ROOTMODE" = 1 ] || return 0
+  real=$(rootresolve "$1") || { why="symbolic link loop"; return 1; }
+}
+
+# unreachable PATH: true when PATH is absent only because a parent directory cannot be entered
+# (e.g. Android's /data/misc/user/0/cacerts-added from an unprivileged shell). Silence there
+# would look like "no such store" while user-added CAs may exist.
+unreachable() {
+  [ "$ROOTMODE" = 0 ] || return 1
+  ue=$(ls -d "$1" 2>&1)
+  case $ue in *[Pp]ermission\ denied*) return 0 ;; esac
+  return 1
+}
+
+# scan_file PATH [explicit]: a bundle file. Probing absent well-known paths is silent;
+# anything that exists (or was named) but cannot be read is reported.
+scan_file() {
+  f=$1
+  resolve "$f" || { not_scanned "$f" "$why"; return 0; }
+  file=$real
+  [ -d "$file" ] && { scan_dir "$f" "${2:-}"; return 0; }
+  case "$paths" in *"|$f|"*) return 0 ;; esac # already visited under this exact name
+  paths="$paths|$f|"
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+    if unreachable "$file"; then not_scanned "$f" "permission denied (a parent directory cannot be entered)"
+    elif [ "${2:-}" = explicit ]; then not_scanned "$f" "does not exist"; fi
+    return 0
+  fi
+  case ${f##*/} in
+    cacerts | jssecacerts) scan_jks "$f"; return 0 ;;
+    cert9.db | cert8.db) scan_nss "${f%/*}"; return 0 ;;
+  esac
+  if [ ! -r "$file" ]; then not_scanned "$f" "not readable (permissions? dangling link?)"; return 0; fi
+  sum=$(cksum <"$file") || { not_scanned "$f" "read error"; return 0; }
+  case "$filesums" in
+    *"|$sum="*) # same bytes as a file already audited (a link, a copy): do not fingerprint again
+      prior=${filesums#*"|$sum="}
+      row same "$f" "" "same content as ${prior%%|*}, already audited above"
+      return 0 ;;
+  esac
+  filesums="$filesums|$sum=$f|"
+  progress "$f"
+  if ! collect "$file"; then not_scanned "$f" "read error"; return 0; fi
+  report "$f"
+}
+
+# scan_dir DIR [explicit]: every regular file in DIR is one source for a single store.
+scan_dir() {
+  d=$1
+  case "$paths" in *"|$d|"*) return 0 ;; esac
+  paths="$paths|$d|"
+  resolve "$d" || { not_scanned "$d" "$why"; return 0; }
+  dir=$real
+  if [ ! -d "$dir" ]; then
+    if unreachable "$dir"; then not_scanned "$d" "permission denied (a parent directory cannot be entered)"
+    elif [ "${2:-}" = explicit ]; then not_scanned "$d" "not a directory"; fi
+    return 0
+  fi
+  if [ ! -r "$dir" ] || [ ! -x "$dir" ]; then not_scanned "$d" "directory not readable"; return 0; fi
+  if [ -f "$dir/cert9.db" ] || [ -f "$dir/cert8.db" ]; then scan_nss "$d"; return 0; fi # an NSS profile directory
+  set --
+  dangling=0
+  for x in "$dir"/*; do
+    [ -e "$x" ] || [ -L "$x" ] || continue
+    resolve "$x" || { dangling=$((dangling + 1)); continue; }
+    [ -e "$real" ] || { dangling=$((dangling + 1)); continue; }
+    [ -f "$real" ] && [ -r "$real" ] && set -- "$@" "$real"
+  done
+  [ "$dangling" -gt 0 ] && xnote="$dangling dangling symbolic links ignored"
+  if [ $# -eq 0 ]; then row ok "$d" 0 "empty${xnote:+; $xnote}"; xnote=; return 0; fi
+  progress "$d"
+  collect "$@" || { not_scanned "$d" "read error"; return 0; }
+  if [ "$nblocks" -eq 0 ]; then row ok "$d" 0 "no certificate in $# files${xnote:+; $xnote}"; xnote=; return 0; fi
+  report "$d"
+}
+
+# scan_jks FILE: Java keystore, through keytool (the only way to read one without a new dependency).
+scan_jks() {
+  command -v keytool >/dev/null 2>&1 || { not_scanned "$1" "Java keystore and keytool is not installed (see README)"; return; }
+  resolve "$1" || { not_scanned "$1" "$why"; return; }
+  file=$real
+  [ -r "$file" ] || { not_scanned "$1" "not readable"; return; }
+  sum=$(cksum <"$file")
+  case "$jks_seen" in *"|$sum|"*) return ;; esac
+  jks_seen="$jks_seen|$sum|"
+  progress "$1"
+  out=$(keytool -J-Duser.language=en -J-Duser.country=US -list -v -keystore "$file" -storepass changeit 2>/dev/null) ||
+    { not_scanned "$1" "keytool could not open it (custom password?)"; return; }
+  fps=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' | sed 's/://g' | tr 'a-f' 'A-F' |
+    awk 'length($0) == 64 && $0 !~ /[^0-9A-F]/' | sort -u)
+  nfps=$(printf '%s\n' "$fps" | awk 'NF { n++ } END { print n + 0 }')
+  nblocks=$(printf '%s\n' "$out" | awk '/^Alias name:/ { n++ } END { print n + 0 }')
+  nfiles=1 nnopem=0
+  report "$1 (Java keystore)"
+}
+jks_seen=
+
+# scan_nss DIR: an NSS database (cert9.db, or the legacy cert8.db) through certutil, which opens it
+# read-only. Only the certificates stored in the database are listed: the built-in roots of
+# Firefox live in a separate module (libnssckbi) and are NOT seen here.
+scan_nss() {
+  d=$1
+  case "$paths" in *"|nss:$d|"*) return 0 ;; esac
+  paths="$paths|nss:$d|"
+  resolve "$d" || { not_scanned "$d" "$why"; return 0; }
+  dir=$real
+  if [ -f "$dir/cert9.db" ]; then spec=sql:$dir
+  elif [ -f "$dir/cert8.db" ]; then spec=dbm:$dir
+  else return 0; fi
+  label="$d (NSS database)"
+  command -v certutil >/dev/null 2>&1 || { not_scanned "$label" "certutil (nss-tools) is not installed"; return 0; }
+  nrows=$(certutil -L -d "$spec" 2>/dev/null) || { not_scanned "$label" "certutil could not open it"; return 0; }
+  case "$nrows" in
+    *"Trust Attributes"*) ;;
+    *) not_scanned "$label" "unexpected certutil output"; return 0 ;;
+  esac
+  nrows=$(printf '%s\n' "$nrows" | awk '/Trust Attributes[[:space:]]*$/ { h = 1; next } h == 1 { h = 2; next } h == 2 && NF { print }')
+  if [ -z "$nrows" ]; then row ok "$label" 0 "empty"; return 0; fi
+  pem='' bad=0
+  while IFS= read -r nrow; do
+    nick=$(printf '%s\n' "$nrow" | sed 's/[[:space:]]*$//; s/[[:space:]][[:space:]]*[A-Za-z,]*$//')
+    [ -n "$nick" ] || { bad=1; continue; }
+    one=$(certutil -L -d "$spec" -n "$nick" -a 2>/dev/null) || { bad=1; continue; }
+    pem="$pem$one
+"
+  done <<EOF
+$nrows
+EOF
+  [ "$bad" -eq 0 ] || { not_scanned "$label" "some certificates could not be exported"; return 0; }
+  collect <<EOF || { not_scanned "$label" "read error"; return 0; }
+$pem
+EOF
+  nfiles=1 nnopem=0
+  report "$label"
+}
+
+# find_bundles DIR: well-known bundle file names anywhere under DIR (no symlink following).
+find_bundles() {
+  find "$1" \( -path "$1/proc" -o -path "$1/sys" -o -path "$1/dev" \) -prune -o -type f \
+    \( -name ca-certificates.crt -o -name 'cacert*.pem' -o -name 'ca-bundle*' -o -name cert.pem \
+    -o -name tls-ca-bundle.pem -o -name '*roots.pem' -o -name ca-root-nss.crt -o -name curl-ca-bundle.crt \
+    -o -name cacerts -o -name jssecacerts \
+    -o -name cert9.db -o -name cert8.db \) -print
+}
+
+# ------------------------------------------------------------- default stores
+# Well-known locations, by family. Directories hold the generated/trusted set only
+# (never e.g. /usr/share/ca-certificates, which lists candidates, not what is trusted).
+known() { # PREFIX
+  p=$1
+  for f in \
+    /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-bundle.crt /etc/ssl/cert.pem \
+    /etc/pki/tls/certs/ca-bundle.crt /etc/pki/tls/cert.pem /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+    /etc/ssl/ca-bundle.pem /var/lib/ca-certificates/ca-bundle.pem \
+    /etc/ca-certificates/extracted/tls-ca-bundle.pem /etc/static/ssl/certs/ca-bundle.crt \
+    /usr/local/share/certs/ca-root-nss.crt /usr/local/etc/ssl/cert.pem \
+    /usr/local/etc/openssl/cert.pem /usr/local/etc/openssl@3/cert.pem /usr/local/etc/ca-certificates/cert.pem \
+    /opt/homebrew/etc/openssl@3/cert.pem /opt/homebrew/etc/ca-certificates/cert.pem \
+    /opt/local/etc/openssl/cert.pem /opt/local/share/curl/curl-ca-bundle.crt \
+    /mingw64/etc/ssl/certs/ca-bundle.crt; do
+    scan_file "$p$f"
+  done
+  for d in \
+    /etc/ssl/certs /usr/local/share/ca-certificates /etc/pki/ca-trust/source/anchors \
+    /etc/pki/trust/anchors /etc/ca-certificates/trust-source/anchors \
+    /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts /data/misc/user/0/cacerts-added; do
+    scan_dir "$p$d"
+  done
+  scan_nss "$p/etc/pki/nssdb"
+  # Java keystores. In root mode every candidate is resolved inside ROOT before being tested.
+  for k in "$p/etc/ssl/certs/java/cacerts" "$p/etc/pki/java/cacerts"; do
+    resolve "$k" && [ -e "$real" ] && scan_jks "$k"
+  done
+  for base in /usr/lib/jvm /Library/Java/JavaVirtualMachines; do
+    resolve "$p$base" || continue
+    [ -d "$real" ] || continue
+    for k in "$real"/*/lib/security/cacerts "$real"/*/jre/lib/security/cacerts \
+      "$real"/*/Contents/Home/lib/security/cacerts; do
+      [ -e "$k" ] && scan_jks "$k"
+    done
+  done
+}
+
+# The running host: what the environment, openssl, python and curl say they use.
+host_extras() {
+  # variables read by curl, OpenSSL, Python, Node, git, AWS, Cargo, Nix, Deno
+  for v in SSL_CERT_FILE CURL_CA_BUNDLE REQUESTS_CA_BUNDLE PIP_CERT NODE_EXTRA_CA_CERTS GIT_SSL_CAINFO \
+    AWS_CA_BUNDLE CARGO_HTTP_CAINFO NIX_SSL_CERT_FILE DENO_CERT; do
+    val=$(awk -v n="$v" 'BEGIN { print ENVIRON[n] }')
+    [ -n "$val" ] && scan_file "$val" explicit
+  done
+  for v in SSL_CERT_DIR GIT_SSL_CAPATH; do
+    val=$(awk -v n="$v" 'BEGIN { print ENVIRON[n] }')
+    IFS=:
+    for d in $val; do [ -n "$d" ] && scan_dir "$d" explicit; done
+    IFS=$DEFIFS
+  done
+
+  # OpenSSL's compiled-in defaults
+  odir=$(openssl version -d 2>/dev/null | sed -n 's/^OPENSSLDIR: "\(.*\)"$/\1/p')
+  if [ -n "$odir" ]; then scan_file "$odir/cert.pem"; scan_dir "$odir/certs"; fi
+
+  # curl's compiled-in default bundle
+  if command -v curl-config >/dev/null 2>&1; then
+    cb=$(curl-config --ca 2>/dev/null)
+    [ -n "$cb" ] && scan_file "$cb"
+  fi
+
+  # Java: JAVA_HOME, then the keytool found in PATH
+  jh=$(awk 'BEGIN { print ENVIRON["JAVA_HOME"] }')
+  if [ -n "$jh" ]; then
+    for k in "$jh/lib/security/cacerts" "$jh/jre/lib/security/cacerts"; do [ -e "$k" ] && scan_jks "$k"; done
+  fi
+
+  # Python: isolated (-I) and without site (-S) so no .pth/sitecustomize code runs.
+  # It only reports where the interpreter keeps its packages and its OpenSSL paths.
+  if command -v python3 >/dev/null 2>&1; then
+    py=$(python3 -I -S -c '
+import os, ssl, sysconfig
+for p in (sysconfig.get_paths().get("purelib"), sysconfig.get_paths().get("platlib")):
+    if p:
+        print("F", os.path.join(p, "certifi", "cacert.pem"))
+        print("F", os.path.join(p, "pip", "_vendor", "certifi", "cacert.pem"))
+v = ssl.get_default_verify_paths()
+for p in (v.cafile, v.openssl_cafile):
+    if p: print("F", p)
+for p in (v.capath, v.openssl_capath):
+    if p: print("D", p)
+' 2>/dev/null) || note "python3 could not report its paths: Python bundles were not located (use -f)"
+    while IFS=' ' read -r t x; do
+      case $t in F) scan_file "$x" ;; D) scan_dir "$x" ;; esac
+    done <<EOF
+$py
+EOF
+  else
+    note "python3 not found: Python (certifi, pip) bundles were not located; use -f on your environments"
+  fi
+
+  # NSS databases of the user running the audit: shared database (Chrome/Chromium, Linux) and
+  # Firefox/Thunderbird profiles, native, snap, flatpak and macOS locations.
+  hm=$(awk 'BEGIN { print ENVIRON["HOME"] }')
+  if [ -n "$hm" ] && [ -d "$hm" ]; then
+    scan_nss "$hm/.pki/nssdb"
+    for d in "$hm"/.mozilla/firefox/* "$hm"/.thunderbird/* "$hm"/snap/firefox/common/.mozilla/firefox/* \
+      "$hm"/.var/app/org.mozilla.firefox/.mozilla/firefox/* "$hm"/Library/Application\ Support/Firefox/Profiles/*; do
+      [ -d "$d" ] && scan_nss "$d"
+    done
+  fi
+
+  # macOS keychains: presence only, trust settings are not evaluated
+  if command -v security >/dev/null 2>&1; then
+    for kc in /System/Library/Keychains/SystemRootCertificates.keychain /Library/Keychains/System.keychain; do
+      [ -r "$kc" ] || continue
+      # no pipe into collect: a piped function would run in a subshell and its results would be lost
+      if kcpem=$(security find-certificate -a -p "$kc" 2>/dev/null) && [ -n "$kcpem" ] && collect <<EOF
+$kcpem
+EOF
+      then
+        report "keychain $kc (presence only: trust settings not evaluated)"
+      else
+        not_scanned "$kc" "security command failed or returned no certificate"
+      fi
+    done
+  fi
+}
+
+if [ "$DEFAULTS" = 1 ]; then
+  known "$ROOT"
+  [ "$ROOTMODE" = 0 ] && host_extras
+fi
+
+for a in "$@"; do scan_file "$ROOT$a" explicit; done
+
+IFS='
+'
+for d in $FINDS; do
+  [ -n "$d" ] || continue
+  d=$ROOT$d
+  resolve "$d" || { not_scanned "$d" "$why"; continue; }
+  [ -d "$real" ] || { not_scanned "$d" "not a directory"; continue; }
+  d=$real
+  list=$(find_bundles "$d") || not_scanned "$d" "parts of this tree could not be searched (permissions?)"
+  if [ -z "$list" ]; then row ok "$d" "" "no bundle file found by name"; continue; fi
+  while IFS= read -r x; do scan_file "$x"; done <<EOF
+$list
+EOF
+done
+IFS=$DEFIFS
+
+# ------------------------------------------------------------------- verdict
+[ "$PROG" = 1 ] && printf '\r%s[K' "$ESC" >&2
+if [ "$nstores" -eq 0 ] && [ "$incomplete" -eq 0 ]; then
+  echo "trust-audit: no trust store found; name one (FILE/DIR, -r ROOT or -f DIR)" >&2
+  exit 2
+fi
+
+# ------------------------------------------------------------- report output
+if [ "$COLOR" = 1 ]; then
+  B="${ESC}[1m" D="${ESC}[2m" R="${ESC}[31m" Y="${ESC}[33m" G="${ESC}[32m" N="${ESC}[0m"
+else
+  B='' D='' R='' Y='' G='' N=''
+fi
+
+echo
+printf '%s\n' "$rows" | awk -F'\t' -v quiet="$QUIET" -v B="$B" -v D="$D" -v R="$R" -v Y="$Y" -v G="$G" -v N="$N" '
+  NF { n++; st[n] = $1; nm[n] = $2; ct[n] = $3; nt[n] = $4; if (length($2) > w) w = length($2) }
+  END {
+    print B "STORES" N
+    tag["FOUND"] = R "[FOUND]" N; tag["ok"] = G "[ ok  ]" N; tag["same"] = D "[same ]" N
+    tag["SKIP"] = Y "[SKIP ]" N; tag["WARN"] = Y "[WARN ]" N
+    for (i = 1; i <= n; i++) {
+      if (quiet && (st[i] == "ok" || st[i] == "same")) continue
+      pad = nm[i]; while (length(pad) < w) pad = pad " "
+      printf "  %s  %s  %5s", tag[st[i]], pad, ct[i]
+      if (nt[i] != "") printf "  %s", nt[i]
+      printf "\n"
+    }
+  }'
+
+if [ -n "$findings" ]; then
+  echo
+  printf '%s\n' "$findings" | awk -F'\t' -v quiet="$QUIET" -v B="$B" -v D="$D" -v R="$R" -v Y="$Y" -v N="$N" '
+    FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF == 5) { lbl[$1] = $3; why[$1] = $4; ref[$1] = $5 } next }
+    NF {
+      if (!($1 in kind)) { kind[$1] = $2; order[++nf] = $1 }
+      key = $1 SUBSEP $3
+      if (!(key in seen)) { seen[key] = 1; ns[$1]++; stores[$1, ns[$1]] = $3 }
+    }
+    END {
+      split("compromised removed partial", ks, " ")
+      line = ""
+      for (r = 1; r <= 3; r++) {
+        c = 0; for (i = 1; i <= nf; i++) if (kind[order[i]] == ks[r]) c++
+        if (c) line = line (line == "" ? "" : ", ") c " " ks[r]
+      }
+      print B "FINDINGS" N " - " line
+      col["compromised"] = R; col["removed"] = Y; col["partial"] = D
+      for (r = 1; r <= 3; r++) for (i = 1; i <= nf; i++) {
+        f = order[i]; if (kind[f] != ks[r]) continue
+        K = toupper(kind[f])
+        if (quiet) {
+          s = ""; for (j = 1; j <= ns[f]; j++) s = s (j > 1 ? ", " : "") stores[f, j]
+          printf "  %s%-11s%s  %s  (in: %s)\n", col[kind[f]], K, N, lbl[f], s
+          continue
+        }
+        printf "\n  %s%-11s%s  %s%s%s\n", col[kind[f]], K, N, B, lbl[f], N
+        printf "      %s\n      sha256 %s\n", why[f], f
+        nr = split(ref[f], rr, " ")
+        for (j = 1; j <= nr; j++) printf "      ref    %s\n", rr[j]
+        for (j = 1; j <= ns[f]; j++) printf "      %s %s\n", (j == 1 ? "in    " : "      "), stores[f, j]
+      }
+    }' "$LIST" -
+fi
+
+echo
+[ -n "$notes" ] && printf 'note: %s' "$notes"
+if [ "$QUIET" = 1 ]; then
+  echo "Not examined: compiled-in stores, browsers' built-in roots, the Windows store, override settings (see README)."
+else
+  echo "${B}NOT EXAMINED${N}  stores compiled into applications (Node.js, Go/Rust programs), the built-in"
+  echo "              roots of browsers, the Windows certificate store, and settings that override a"
+  echo "              store (macOS trust settings, Java blacklisted.certs, ...). The README lists"
+  echo "              what is covered."
+fi
+if [ "$found" -eq 1 ]; then
+  echo "${R}RESULT: distrusted certificates present in $nhits of $nstores store(s)$([ "$incomplete" -eq 1 ] && echo '; some stores could not be read, see [SKIP]/[WARN] lines')${N}"
+  exit 1
+elif [ "$incomplete" -eq 1 ]; then
+  echo "${Y}RESULT: INCOMPLETE - nothing found in what could be read, but see the [SKIP]/[WARN] lines: this is NOT a clean result${N}"
+  exit 3
+fi
+echo "${G}RESULT: clean - $nstores store(s) read, none holds a listed certificate${N}"
+exit 0

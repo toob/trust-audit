@@ -1,0 +1,3 @@
+# Strictest useful setting: every finding (info/style included) must be fixed, not disabled.
+external-sources=true
+source-path=SCRIPTDIR

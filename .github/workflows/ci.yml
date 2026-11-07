@@ -1,0 +1,49 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck trust-audit update-list tests/*.sh
+      - run: tests/test-trust-audit.sh
+
+  portability:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [alpine:3.8, alpine:3.20, ubuntu:16.04, debian:12]
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install openssl
+        run: |
+          if command -v apk >/dev/null; then apk add --no-cache bash $( [ "${{ matrix.image }}" = alpine:3.8 ] && echo libressl || echo openssl ); \
+          else apt-get update && apt-get install -y openssl; fi
+      - run: bash tests/test-trust-audit.sh
+
+  powershell:
+    name: powershell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: pwsh -NoProfile -File tests/test-trust-audit.ps1
+      - name: Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell -NoProfile -File tests/test-trust-audit.ps1
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tests/test-trust-audit.sh
