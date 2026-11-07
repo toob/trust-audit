@@ -313,18 +313,21 @@ Android (Pixel 8 Pro): tested in the *Terminal* app, which is a Debian VM, so th
 Android's real stores. **Not tested:** the script on Android's real stores (needs `adb` and root, or
 copy the stores locally and audit the copy).
 
+macOS: one user report - the audit runs to completion and reports findings. macOS and `openssl`
+versions were not reported, and the test suite has not been run there.
+
 PowerShell edition: PowerShell 7.4 on Linux only (its test suite passes there; the stores are read
 through the same .NET `X509Store` API).
 
 ### 🙋 Testers wanted
 
-These have **never been run on the real system**; their store paths come from documentation only.
-A report, even "works" or "crashes with this output", is valuable:
+These have **never been run on the real system** (macOS: a single report, see above); their store
+paths come from documentation only. A report, even "works" or "crashes with this output", is valuable:
 
 | System | What to run | What to report |
 | --- | --- | --- |
 | **Windows** (PowerShell 5.1 and 7) | `.\trust-audit.ps1` and `tests\test-trust-audit.ps1` | output, exit code, PowerShell version |
-| **macOS** (current and old) | `./trust-audit` and `tests/test-trust-audit.sh` | output, exit code, `openssl version` (LibreSSL) |
+| **macOS** (current and old) | `./trust-audit` and `tests/test-trust-audit.sh` | output, exit code, `sw_vers`, `openssl version` (LibreSSL) |
 | OpenBSD / NetBSD, Git Bash | `./trust-audit` | same |
 
 Open an issue with the output (remove host names if you prefer), see [CONTRIBUTING.md](CONTRIBUTING.md).
