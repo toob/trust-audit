@@ -18,14 +18,18 @@ jobs:
       fail-fast: false
       matrix:
         image: [alpine:3.8, alpine:3.20, ubuntu:16.04, debian:12]
-    container: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4
-      - name: install openssl
+      # run in a plain `docker run`: the old images cannot host the JavaScript actions
+      - name: tests in ${{ matrix.image }}
         run: |
-          if command -v apk >/dev/null; then apk add --no-cache bash $( [ "${{ matrix.image }}" = alpine:3.8 ] && echo libressl || echo openssl ); \
-          else apt-get update && apt-get install -y openssl; fi
-      - run: bash tests/test-trust-audit.sh
+          docker run --rm -v "$PWD:/w" -w /w ${{ matrix.image }} sh -c '
+            if command -v apk >/dev/null; then
+              apk add --no-cache bash $( [ "${{ matrix.image }}" = alpine:3.8 ] && echo libressl || echo openssl )
+            else
+              apt-get update && apt-get install -y openssl
+            fi
+            bash tests/test-trust-audit.sh'
 
   powershell:
     name: powershell (${{ matrix.os }})

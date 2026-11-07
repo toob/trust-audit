@@ -27,9 +27,12 @@ function New-TestCert([string]$Name) {
 }
 
 # Runs the audit in a child process; sets $script:Out (text) and $script:Rc.
+# (Windows PowerShell 5.1 turns a child's stderr into a terminating error under 'Stop', hence 'Continue'.)
 function Invoke-Audit([string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue'
     $script:Out = (& $Exe -NoProfile -File $TA @Arguments *>&1 | Out-String)
     $script:Rc = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
 }
 
 $bad = New-TestCert 'bad'; $good = New-TestCert 'good'; $comp = New-TestCert 'comp'
@@ -57,7 +60,7 @@ Check 'scope disclaimer always printed' ($Out.Contains('NOT EXAMINED'))
 Check 'no colour codes when redirected' (-not $Out.Contains([string][char]27))
 $onlyBad = Join-Path $T 'only-bad.pem'; [IO.File]::WriteAllText($onlyBad, $bad.Pem)
 Invoke-Audit '-NoDefault', '-List', $listFile, '-Path', $bundle
-$script:Out = (& $Exe -NoProfile -Command "& '$TA' -NoDefault -List '$listFile' -Path '$bundle','$onlyBad'; exit `$LASTEXITCODE" *>&1 | Out-String)
+$ErrorActionPreference = 'Continue'; $script:Out = (& $Exe -NoProfile -Command "& '$TA' -NoDefault -List '$listFile' -Path '$bundle','$onlyBad'; exit `$LASTEXITCODE" *>&1 | Out-String); $ErrorActionPreference = 'Stop'
 Check 'same certificate in two stores: one finding' (([regex]::Matches($Out, 'REMOVED      Test Removed CA')).Count -eq 1)
 Check '... listing both stores' ($Out.Contains("      $onlyBad"))
 Check 'findings summary' ($Out.Contains('FINDINGS - 1 removed'))
@@ -83,7 +86,7 @@ Check 'non-PEM file reported as skipped' ($Out.Contains('1 of 3 files held no PE
 # several paths need a real array, so this one goes through -Command (with -File, 'a,b' stays one string)
 Copy-Item $bundle (Join-Path $T 'bundle-copy.pem')
 $cmd = "& '$TA' -NoDefault -List '$listFile' -Path '$bundle','$(Join-Path $T 'bundle-copy.pem')'; exit `$LASTEXITCODE"
-$script:Out = (& $Exe -NoProfile -Command $cmd *>&1 | Out-String); $script:Rc = $LASTEXITCODE
+$ErrorActionPreference = 'Continue'; $script:Out = (& $Exe -NoProfile -Command $cmd *>&1 | Out-String); $script:Rc = $LASTEXITCODE; $ErrorActionPreference = 'Stop'
 Check 'two paths accepted, rc=1' ($Rc -eq 1)
 Check 'same set audited once' ($Out.Contains('identical set to'))
 

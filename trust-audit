@@ -374,7 +374,7 @@ scan_nss() {
     *"Trust Attributes"*) ;;
     *) not_scanned "$label" "unexpected certutil output"; return 0 ;;
   esac
-  nrows=$(printf '%s\n' "$nrows" | awk '/Trust Attributes[[:space:]]*$/ { h = 1; next } h == 1 { h = 2; next } h == 2 && NF { print }')
+  nrows=$(printf '%s\n' "$nrows" | awk '/Trust Attributes[ \t]*$/ { h = 1; next } h == 1 { h = 2; next } h == 2 && NF { print }')
   if [ -z "$nrows" ]; then row ok "$label" 0 "empty"; return 0; fi
   pem='' bad=0
   while IFS= read -r nrow; do
@@ -591,7 +591,8 @@ if [ -n "$findings" ]; then
       line = ""
       for (r = 1; r <= 3; r++) {
         c = 0; for (i = 1; i <= nf; i++) if (kind[order[i]] == ks[r]) c++
-        if (c) line = line (line == "" ? "" : ", ") c " " ks[r]
+        sep = (line == "" ? "" : ", ")
+        if (c) line = line sep c " " ks[r]
       }
       print B "FINDINGS" N " - " line
       col["compromised"] = R; col["removed"] = Y; col["partial"] = D
@@ -599,7 +600,7 @@ if [ -n "$findings" ]; then
         f = order[i]; if (kind[f] != ks[r]) continue
         K = toupper(kind[f])
         if (quiet) {
-          s = ""; for (j = 1; j <= ns[f]; j++) s = s (j > 1 ? ", " : "") stores[f, j]
+          s = ""; for (j = 1; j <= ns[f]; j++) { sep = (j > 1 ? ", " : ""); s = s sep stores[f, j] }
           printf "  %s%-11s%s  %s  (in: %s)\n", col[kind[f]], K, N, lbl[f], s
           continue
         }
