@@ -1,0 +1,10 @@
+# Your own certificate authorities: copy this file to known-roots.local.tsv (next to trust-audit;
+# git-ignored, never shipped) and list the roots this machine is meant to trust that no public
+# root program includes - internal PKI, TLS-inspection proxy, a CA pushed by GPO or MDM.
+# trust-audit then no longer reports them as unknown, and says how many it accepted.
+#
+# One per line: the SHA-256 printed by trust-audit (upper or lower case), then, separated by TABs,
+# optionally a label and why it is trusted (owner, ticket, date). Lines starting with # are ignored.
+#
+# sha256	label	why
+# 8C62495F4535C93FE7CA8C7E1457FCF046AA3D0CEE6F336266A30D579D569210	Example Corp TLS Inspection CA	IT security, ticket SEC-1234, 2026-11

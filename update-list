@@ -1,35 +1,66 @@
 #!/bin/sh
-# update-list - rebuild distrusted.tsv. Maintainer tool: the only part of trust-audit that
-# uses the network (the audit itself never does). Run it, review `git diff`, commit.
+# update-list - rebuild the lists trust-audit reads. Maintainer tool: the only part of trust-audit
+# that uses the network (the audit itself never does). Run it, review `git diff`, commit.
 #
-# Inputs:
+# Usage: update-list              rebuild distrusted.tsv and known-roots.tsv; say whether
+#                                 known-roots-extra.tsv is behind its source
+#        update-list --extras     also rebuild known-roots-extra.tsv from the observatory
+#        update-list --dry-run    write nothing; say which lists would change
+#                                 (exit 0 all up to date, 1 something to update, 2 could not check)
+#
+# distrusted.tsv (sha256, kind, label, reason, ref) - certificates that should not be trusted:
 #   sources/curated.tsv     curated, frozen incident data (eMudhra 2026, DigiNotar ... TrustCor), edited by hand
 #   Mozilla / CCADB         roots listed in the "removed roots" report            (kind "removed")
 #   Mozilla / CCADB         roots still included but with a "Distrust for TLS
 #                           After" date                                           (kind "partial")
 #   Mozilla / CCADB         roots the full records report marks "Removed" - the
 #                           removed-roots report above omits some (kind "removed")
-# Earlier sources win when a fingerprint appears twice.
+#   Earlier sources win when a fingerprint appears twice.
 #
-# Output columns (tab-separated): sha256, kind, label, reason, ref (URL of the incident or bug; may be empty).
-# Usage: update-list [output]      (default: distrusted.tsv next to this script)
-# Needs: curl, awk.
+# known-roots.tsv (sha256, programs, label) - roots of the public root programs: the CCADB full
+#   records report, roots "Included" by Apple, Chrome, Microsoft or Mozilla (Microsoft "NotBefore"
+#   counts as included and is noted microsoft~).
+#
+# known-roots-extra.tsv (sha256, stores, label) - roots the trust_stores_observatory lists as trusted
+#   by a platform (Apple's own roots, Android, Java...) that known-roots.tsv does not hold. Read at a
+#   pinned commit; `--extras` moves the pin. Source: https://github.com/nabla-c0d3/trust_stores_observatory
+#   (MIT License, Copyright (c) 2025 Alban Diquet).
+#
+# Needs: curl, awk, sort, comm.
 
 set -eu
 LC_ALL=C
 export LC_ALL
 
-here=$(cd "$(dirname "$0")" && pwd)
-out=${1:-$here/distrusted.tsv}
-CCADB=https://ccadb.my.salesforce-sites.com/mozilla
+MODE=update
+case ${1:-} in
+  '') ;;
+  --dry-run) MODE=dry ;;
+  --extras) MODE=extras ;;
+  -h | --help) sed -n '2,/^# Needs/s/^# \{0,1\}//p' "$0"; exit 0 ;;
+  *) echo "update-list: unknown argument: $1 (see --help)" >&2; exit 2 ;;
+esac
 
-for c in curl awk sort; do command -v "$c" >/dev/null 2>&1 || { echo "update-list: $c is required" >&2; exit 2; }; done
+here=$(cd "$(dirname "$0")" && pwd)
+DIST=$here/distrusted.tsv
+KNOWN=$here/known-roots.tsv
+EXTRA=$here/known-roots-extra.tsv
+CCADB=https://ccadb.my.salesforce-sites.com/mozilla
+OBS_REPO=nabla-c0d3/trust_stores_observatory
+OBS_FILES="apple google_aosp microsoft_windows mozilla_nss openjdk oracle_java"
+OBS_CREDIT="https://github.com/$OBS_REPO (MIT License, Copyright (c) 2025 Alban Diquet)"
+
+for c in curl awk sort comm; do command -v "$c" >/dev/null 2>&1 || { echo "update-list: $c is required" >&2; exit 2; }; done
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/trust-audit-upd.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
-curl -fsSL --max-time 60 "$CCADB/RemovedCACertificateReportCSVFormat" -o "$tmp/removed.csv"
-curl -fsSL --max-time 60 "$CCADB/IncludedCACertificateReportPEMCSV" -o "$tmp/included.csv"
-curl -fsSL --max-time 280 "https://ccadb.my.salesforce-sites.com/ccadb/AllCertificateRecordsCSVFormatV5" -o "$tmp/all.csv"
+# fail MESSAGE: network or format problem. A dry run reports it as "could not check" (exit 2).
+fail() { echo "update-list: $*" >&2; exit 2; }
+fetch() { curl -fsSL --max-time "$1" "$2" -o "$3" || fail "download failed: $2"; }
+
+fetch 60 "$CCADB/RemovedCACertificateReportCSVFormat" "$tmp/removed.csv"
+fetch 60 "$CCADB/IncludedCACertificateReportPEMCSV" "$tmp/included.csv"
+fetch 280 "https://ccadb.my.salesforce-sites.com/ccadb/AllCertificateRecordsCSVFormatV5" "$tmp/all.csv"
 
 # csv_cols "Header A|Header B|..." FILE -> TSV of those columns, looked up BY HEADER NAME so a
 # reordered report cannot silently shift columns. RFC 4180: quoted fields may hold newlines.
@@ -61,34 +92,165 @@ csv_cols() {
     END { if (bad) exit 1 }' "$2"
 }
 
+# --------------------------------------------------------------- distrusted.tsv
 csv_cols "SHA-256 Fingerprint|Root Certificate Name|NSS Release When Removed|Removal Bug No. or Date" "$tmp/removed.csv" |
   awk -F'\t' '
     { ref = ""
       if ($4 ~ /^https?:\/\//) ref = $4                                     # a URL
       else if ($4 ~ /^[0-9][0-9][0-9][0-9][0-9]+$/) ref = "https://bugzilla.mozilla.org/show_bug.cgi?id=" $4   # a bare bug number
-      printf "%s\tremoved\t%s\tremoved from Mozilla NSS in %s\t%s\n", $1, $2, $3, ref }' >"$tmp/removed.tsv"
+      printf "%s\tremoved\t%s\tremoved from Mozilla NSS in %s\t%s\n", $1, $2, $3, ref }' >"$tmp/removed.tsv" ||
+  fail "removed-roots report: unexpected format"
 csv_cols "SHA-256 Fingerprint|Common Name or Certificate Name|Distrust for TLS After Date" "$tmp/included.csv" |
-  awk -F'\t' '$3 != "" { printf "%s\tpartial\t%s\tMozilla distrusts TLS certificates issued after %s (a flat bundle cannot express the date)\t\n", $1, $2, $3 }' >"$tmp/after.tsv"
-
+  awk -F'\t' '$3 != "" { printf "%s\tpartial\t%s\tMozilla distrusts TLS certificates issued after %s (a flat bundle cannot express the date)\t\n", $1, $2, $3 }' >"$tmp/after.tsv" ||
+  fail "included-roots report: unexpected format"
 csv_cols "Certificate Record Type|Mozilla Status|SHA-256 Fingerprint|Certificate Name" "$tmp/all.csv" |
-  awk -F'\t' '$1 ~ /^Root/ && $2 == "Removed" { printf "%s\tremoved\t%s\tno longer in Mozilla'"'"'s root store (CCADB status: Removed)\t\n", $3, $4 }' >"$tmp/allremoved.tsv"
+  awk -F'\t' '$1 ~ /^Root/ && $2 == "Removed" { printf "%s\tremoved\t%s\tno longer in Mozilla'"'"'s root store (CCADB status: Removed)\t\n", $3, $4 }' >"$tmp/allremoved.tsv" ||
+  fail "full records report: unexpected format"
 
 nrem=$(awk 'END { print NR }' "$tmp/removed.tsv")
 nall=$(awk 'END { print NR }' "$tmp/allremoved.tsv")
 if [ "$nrem" -lt 50 ] || [ "$nall" -lt 100 ]; then
-  echo "update-list: only $nrem + $nall removed roots parsed, refusing to write (format change?)" >&2
-  exit 1
+  fail "only $nrem + $nall removed roots parsed, refusing to write (format change?)"
 fi
 
+today=$(date -u +%Y-%m-%d)
 now=$(date +%s)
 {
-  printf '# generated=%s epoch=%s\n' "$(date -u +%Y-%m-%d)" "$now"
+  printf '# generated=%s epoch=%s\n' "$today" "$now"
   printf '# sha256\tkind\tlabel\treason\tref\n'
   grep -hv '^#' "$here/sources/curated.tsv" "$tmp/removed.tsv" "$tmp/after.tsv" "$tmp/allremoved.tsv" |
     awk -F'\t' 'BEGIN { OFS = "\t" } { $1 = toupper($1) }
       length($1) != 64 || $1 ~ /[^0-9A-F]/ { printf "update-list: skipped an entry with an invalid fingerprint: %s (%s)\n", $3, $1 > "/dev/stderr"; next }
       !seen[$1]++ { if (NF < 5) $5 = ""; print }'
-} >"$tmp/new.tsv"
+} >"$tmp/distrusted.tsv"
 
-mv "$tmp/new.tsv" "$out"
-echo "wrote $out: $(grep -vc '^#' "$out") fingerprints"
+# -------------------------------------------------------------- known-roots.tsv
+csv_cols "Certificate Record Type|SHA-256 Fingerprint|Certificate Name|Apple Status|Chrome Status|Microsoft Status|Mozilla Status" "$tmp/all.csv" |
+  awk -F'\t' '
+    $1 !~ /^Root/ { next }
+    { p = ""
+      if ($4 == "Included") p = p ",apple"
+      if ($5 == "Included") p = p ",chrome"
+      if ($6 == "Included") p = p ",microsoft"; else if ($6 == "NotBefore") p = p ",microsoft~"
+      if ($7 == "Included") p = p ",mozilla"
+      if (p == "") next
+      fp = toupper($2)
+      if (length(fp) != 64 || fp ~ /[^0-9A-F]/) next
+      if (!seen[fp]++) printf "%s\t%s\t%s\n", fp, substr(p, 2), $3 }' | sort >"$tmp/known.body" ||
+  fail "full records report: unexpected format"
+nknown=$(awk 'END { print NR }' "$tmp/known.body")
+[ "$nknown" -ge 300 ] || fail "only $nknown included roots parsed, refusing to write (format change?)"
+{
+  printf '# generated=%s epoch=%s\n' "$today" "$now"
+  printf '# source=CCADB AllCertificateRecordsCSVFormatV5: roots Included by Apple, Chrome, Microsoft or Mozilla (microsoft~ = Microsoft NotBefore)\n'
+  printf '# sha256\tprograms\tlabel\n'
+  cat "$tmp/known.body"
+} >"$tmp/known-roots.tsv"
+
+# ------------------------------------------------------- known-roots-extra.tsv
+# The latest commit touching trust_stores/ in the observatory (GitHub API, unauthenticated).
+obs_head() {
+  curl -fsSL --max-time 30 "https://api.github.com/repos/$OBS_REPO/commits?path=trust_stores&per_page=1" \
+    -o "$tmp/head.json" 2>/dev/null || return 1
+  obs_sha=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' "$tmp/head.json" | head -n 1)
+  obs_date=$(sed -n 's/^[[:space:]]*"date":[[:space:]]*"\([0-9-]\{10\}\).*/\1/p' "$tmp/head.json" | head -n 1)
+  [ -n "$obs_sha" ]
+}
+pinned_sha=$(sed -n 's/^# synced=.* commit=\([0-9a-f]\{40\}\).*/\1/p' "$EXTRA" 2>/dev/null | head -n 1)
+pinned_day=$(sed -n 's/^# synced=\([0-9-]*\) .*/\1/p' "$EXTRA" 2>/dev/null | head -n 1)
+
+extra_state=
+if obs_head; then
+  if [ -z "$pinned_sha" ]; then extra_state="missing or without a pinned commit; run update-list --extras"
+  elif [ "$obs_sha" != "$pinned_sha" ]; then
+    extra_state="behind - the observatory's trust_stores changed on ${obs_date:-?} (pinned $(printf %.7s "$pinned_sha") of ${pinned_day:-?}); run update-list --extras"
+  fi
+else
+  obs_sha='' obs_date=''
+  extra_state="could not reach the GitHub API to compare the pinned commit"
+fi
+
+build_extra() { # SHA -> $tmp/known-roots-extra.tsv
+  for f in $OBS_FILES; do
+    fetch 60 "https://raw.githubusercontent.com/$OBS_REPO/$1/trust_stores/$f.yaml" "$tmp/$f.yaml"
+  done
+  # trusted_certificates entries: "- subject_name: X" then "  fingerprint: Y"
+  for f in $OBS_FILES; do
+    awk -v store="$f" '
+      /^[a-z_]+:/ { sect = $1 }
+      sect != "trusted_certificates:" { next }
+      /^- subject_name:/ { sub(/^- subject_name:[ \t]*/, ""); gsub(/^["'"'"']|["'"'"']$/, ""); gsub(/\t/, " "); name = $0; next }
+      /^[ \t]+fingerprint:/ { fp = toupper($2); if (length(fp) == 64 && fp !~ /[^0-9A-F]/) print fp "\t" store "\t" name; name = "" }' "$tmp/$f.yaml"
+  done >"$tmp/obs.tsv"
+  nobs=$(awk 'END { print NR }' "$tmp/obs.tsv")
+  [ "$nobs" -ge 500 ] || fail "only $nobs observatory entries parsed, refusing to write (format change?)"
+  {
+    printf '# synced=%s epoch=%s commit=%s commit_date=%s\n' "$today" "$now" "$1" "${obs_date:-unknown}"
+    printf '# source=%s\n' "$OBS_CREDIT"
+    printf '# Roots the observatory lists as trusted by a platform, absent from known-roots.tsv (CCADB).\n'
+    printf '# sha256\tstores\tlabel\n'
+    awk -F'\t' '
+      FILENAME == ARGV[1] { if ($0 !~ /^#/) known[$1] = 1; next }
+      ($1 in known) { next }
+      !($1 in st) { order[++n] = $1; lbl[$1] = $3; st[$1] = $2; next }
+      index("," st[$1] ",", "," $2 ",") == 0 { st[$1] = st[$1] "," $2 }
+      END { for (i = 1; i <= n; i++) printf "%s\t%s\t%s\n", order[i], st[order[i]], lbl[order[i]] }' \
+      "$tmp/known-roots.tsv" "$tmp/obs.tsv" | sort
+  } >"$tmp/known-roots-extra.tsv"
+}
+
+if [ "$MODE" = extras ]; then
+  [ -n "$obs_sha" ] || fail "cannot rebuild known-roots-extra.tsv: the GitHub API is not reachable"
+  build_extra "$obs_sha"
+  extra_state=
+fi
+
+# Entries of the current extra file that the CCADB now covers, or that distrusted.tsv lists.
+extra_overlap() {
+  [ -r "$EXTRA" ] || return 0
+  awk -F'\t' '
+    FILENAME == ARGV[1] { if ($0 !~ /^#/) k[$1] = 1; next }
+    FILENAME == ARGV[2] { if ($0 !~ /^#/) d[$1] = 1; next }
+    /^#/ { next }
+    ($1 in k) { r++ } ($1 in d) { x++ }
+    END { if (r) printf "known-roots-extra.tsv: %d entries now in known-roots.tsv (dropped at the next --extras)\n", r
+          if (x) printf "known-roots-extra.tsv: %d entries are in distrusted.tsv, which takes precedence\n", x }' \
+    "$tmp/known-roots.tsv" "$tmp/distrusted.tsv" "$EXTRA"
+}
+
+# ------------------------------------------------------------------- outputs
+body() { grep -v '^#' "$1" 2>/dev/null | sort; }
+diffcount() { # NAME NEW OLD -> one line; returns 1 when they differ
+  body "$2" >"$tmp/a"; body "$3" >"$tmp/b"
+  add=$(comm -23 "$tmp/a" "$tmp/b" | awk 'END { print NR }')
+  del=$(comm -13 "$tmp/a" "$tmp/b" | awk 'END { print NR }')
+  if [ ! -e "$3" ]; then echo "$1: missing ($add entries to write)"; return 1; fi
+  if [ "$add" -eq 0 ] && [ "$del" -eq 0 ]; then echo "$1: up to date"; return 0; fi
+  echo "$1: $add added, $del removed"; return 1
+}
+
+if [ "$MODE" = dry ]; then
+  rc=0
+  diffcount distrusted.tsv "$tmp/distrusted.tsv" "$DIST" || rc=1
+  diffcount known-roots.tsv "$tmp/known-roots.tsv" "$KNOWN" || rc=1
+  case $extra_state in
+    '') echo "known-roots-extra.tsv: up to date (pinned $(printf %.7s "$pinned_sha") of ${pinned_day:-?})" ;;
+    could\ not*) echo "known-roots-extra.tsv: $extra_state"; [ "$rc" = 1 ] || rc=2 ;;
+    *) echo "known-roots-extra.tsv: $extra_state"; rc=1 ;;
+  esac
+  extra_overlap
+  exit "$rc"
+fi
+
+mv "$tmp/distrusted.tsv" "$DIST"
+echo "wrote $DIST: $(grep -vc '^#' "$DIST") fingerprints"
+mv "$tmp/known-roots.tsv" "$KNOWN"
+echo "wrote $KNOWN: $(grep -vc '^#' "$KNOWN") roots"
+if [ "$MODE" = extras ]; then
+  mv "$tmp/known-roots-extra.tsv" "$EXTRA"
+  echo "wrote $EXTRA: $(grep -vc '^#' "$EXTRA") roots, pinned to $OBS_REPO@$(printf %.7s "$obs_sha") ($obs_date)"
+  echo "source: $OBS_CREDIT"
+else
+  [ -z "$extra_state" ] || echo "known-roots-extra.tsv: $extra_state"
+  extra_overlap
+fi

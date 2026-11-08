@@ -3,7 +3,8 @@
 ## Reporting
 
 Report a vulnerability, or a wrong result that could give false assurance (a distrusted
-certificate that is present but not reported, or a store reported clean that was not fully read),
+certificate that is present but not reported, a certificate in no public root program that is not
+reported as unknown, or a store reported clean that was not fully read),
 privately through GitHub's *Report a vulnerability* button on this repository (private advisory).
 Do not open a public issue for those. You can expect an acknowledgement within a few days.
 

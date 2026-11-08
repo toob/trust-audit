@@ -1,16 +1,18 @@
 #!/bin/sh
-# trust-audit - list the CA certificates that should no longer be trusted but are
-# still present in this machine's (or an unpacked image's) trust stores.
+# trust-audit - tell whether this machine's (or an unpacked image's) trust stores hold a
+# certificate authority that should not be there: one tied to a stolen key, one the root
+# programs have removed, or one that belongs to no public root program at all (added by an
+# administrator - or by an implant).
 #
 # Read-only and offline: it only reads files and runs a few local commands to
 # locate and read stores (openssl, python3, keytool, certutil, security). It writes nothing, not even
 # temporary files, and never touches the network. See README.md for exactly what
 # is, and is not, covered.
 #
-# Exit status: 0 clean · 1 distrusted certificate(s) found · 2 cannot run / bad usage
+# Exit status: 0 nothing to do · 1 something to fix or check · 2 cannot run / bad usage
 #              3 nothing found but some store could not be read (NOT a clean result)
 
-VERSION=0.1.0
+VERSION=0.2.0
 LC_ALL=C
 export LC_ALL
 set -u
@@ -18,6 +20,9 @@ DEFIFS=$IFS
 
 here=$(cd "$(dirname "$0")" && pwd)
 LIST=$here/distrusted.tsv
+KNOWN=$here/known-roots.tsv
+EXTRA=$here/known-roots-extra.tsv
+LOCAL=$here/known-roots.local.tsv
 STALE_DAYS=90
 
 # Public self-test certificate (ISRG Root X2) and its SHA-256, published by Mozilla's CCADB.
@@ -41,17 +46,22 @@ usage() {
   cat <<'EOF'
 Usage: trust-audit [options] [FILE|DIR ...]
 
-Audits the CA trust stores of this machine; FILE/DIR arguments (PEM bundle, or a
-directory of PEM files) are audited too.
+Audits the CA trust stores of this machine and says whether there is something to fix
+or to check; FILE/DIR arguments (PEM bundle, or a directory of PEM files) are audited too.
 
   -r ROOT   audit an unpacked container image / mounted filesystem rooted at ROOT
             instead of this host: no environment or host runtime is consulted, symbolic
             links are followed inside ROOT, and FILE/DIR/-f paths are paths inside it
   -f DIR    also search the tree DIR for bundle files by name (repeatable)
   -n        audit only what is named (arguments, -f), not the default locations
-  -k KINDS  comma-separated kinds to report: compromised,removed,partial (default: all)
-  -q        quiet: only stores with a problem and one line per finding
+  -k KINDS  comma-separated kinds to report: compromised,removed,partial,unknown
+            (default: all)
+  -q        quiet: only stores with a problem and one line per item
+  -v        verbose: every certificate with its fingerprint, reason and references
   -l LIST   fingerprint list to use (default: distrusted.tsv next to this script)
+
+Your own roots (internal PKI, TLS-inspection proxy...) go in known-roots.local.tsv next to
+this script, one sha256 per line: they are then no longer reported as unknown.
   -V        print the version      -h  print this help
 EOF
 }
@@ -64,13 +74,15 @@ ROOTMODE=0
 FINDS=
 DEFAULTS=1
 QUIET=0
-KINDS=compromised,removed,partial
-while getopts 'hVnqr:f:k:l:' opt; do
+VERBOSE=0
+KINDS=compromised,removed,partial,unknown
+while getopts 'hVnqvr:f:k:l:' opt; do
   case $opt in
     h) usage; exit 0 ;;
     V) echo "trust-audit $VERSION"; exit 0 ;;
     n) DEFAULTS=0 ;;
     q) QUIET=1 ;;
+    v) VERBOSE=1 ;;
     r) [ -d "$OPTARG" ] || die "-r: not a directory: $OPTARG"; ROOT=${OPTARG%/}; ROOTMODE=1 ;;
     f) FINDS=$FINDS$OPTARG
        FINDS=$FINDS'
@@ -85,7 +97,7 @@ shift $((OPTIND - 1))
 case ",$KINDS," in *,,*) die "-k: empty kind" ;; esac
 IFS=,
 for k in $KINDS; do
-  case $k in compromised | removed | partial) ;; *) die "-k: unknown kind '$k'" ;; esac
+  case $k in compromised | removed | partial | unknown) ;; *) die "-k: unknown kind '$k'" ;; esac
 done
 IFS=$DEFIFS
 
@@ -113,16 +125,19 @@ progress() { [ "$PROG" = 1 ] && printf '\r%s[K  reading %s' "$ESC" "$1" >&2; ret
 #   nblocks  distinct certificate blocks seen      nfps    blocks that openssl fingerprinted
 #   nfiles   files read                            nnopem  files without any certificate
 # nblocks > nfps means some certificate could not be parsed: the caller must say so.
+# Each certificate's description is appended to subj, for the report (see describe below).
+# Every certificate gets its own openssl run, followed by an #END line: awk flushes its own
+# output around each run, so the lines of one certificate stay together.
 collect() {
   raw=$(awk '
-    BEGIN { cmd = "openssl x509 -noout -fingerprint -sha256 2>/dev/null" }
+    BEGIN { cmd = "openssl x509 -noout -fingerprint -sha256 -subject -text 2>/dev/null" }
     FNR == 1 { if (nfiles > 0 && !hit) nopem++; nfiles++; hit = 0 }
     { sub(/\r$/, "") }
     /^-----BEGIN [A-Z0-9 ]*CERTIFICATE-----[ \t]*$/ { inb = 1; blk = "" }
     inb { blk = blk $0 "\n" }
     /^-----END [A-Z0-9 ]*CERTIFICATE-----[ \t]*$/ && inb {
       inb = 0; hit = 1
-      if (!(blk in seen)) { seen[blk] = 1; nblocks++; printf "%s", blk | cmd; close(cmd) }
+      if (!(blk in seen)) { seen[blk] = 1; nblocks++; fflush(); printf "%s", blk | cmd; close(cmd); print "#END"; fflush() }
     }
     END { if (nfiles > 0 && !hit) nopem++
           print "#BLOCKS " nblocks + 0; print "#FILES " nfiles + 0; print "#NOPEM " nopem + 0 }' "$@") ||
@@ -134,8 +149,34 @@ collect() {
   nblocks=$(printf '%s\n' "$raw" | sed -n 's/^#BLOCKS //p')
   nfiles=$(printf '%s\n' "$raw" | sed -n 's/^#FILES //p')
   nnopem=$(printf '%s\n' "$raw" | sed -n 's/^#NOPEM //p')
+  subj=$subj$(printf '%s\n' "$raw" | describe)'
+'
   return 0
 }
+
+# describe: openssl x509 -fingerprint -subject -text output, certificates separated by #END ->
+#   fingerprint TAB subject TAB ca TAB names
+# ca is 0 for a certificate that says CA:FALSE (it cannot issue certificates, it can only vouch
+# for itself), 1 otherwise (CA:TRUE, or no basic constraints: version 1 roots have none).
+# names are the DNS names it is valid for (subject alternative names, else its CN).
+describe() {
+  awk -v t="$TAB" '
+    function flush() {
+      if (fp != "") { if (names == "") names = cn; print fp t sj t ca t names }
+      fp = ""; sj = ""; cn = ""; names = ""; ca = 1; nx = ""
+    }
+    BEGIN { ca = 1 }
+    /^#END$/ { flush(); next }
+    /Fingerprint=/ { fp = $0; sub(/^.*Fingerprint=/, "", fp); gsub(/:/, "", fp); fp = toupper(fp); next }
+    /^subject=/ { sj = $0; sub(/^subject=[ \t]*/, "", sj); gsub(/\t/, " ", sj)
+                  c = sj; if (sub(/.*CN[ ]*=[ ]*/, "", c)) { sub(/[,\/].*/, "", c); cn = c }; next }
+    nx == "bc" { if ($0 ~ /CA:FALSE/) ca = 0; nx = ""; next }
+    nx == "san" { n = split($0, a, ","); for (i = 1; i <= n; i++) if (sub(/^[ \t]*DNS:/, "", a[i])) sp = names == "" ? "" : " "; names = names sp a[i]; nx = ""; next }
+    /X509v3 Basic Constraints:/ { nx = "bc"; next }
+    /X509v3 Subject Alternative Name:/ { nx = "san"; next }
+    END { flush() }'
+}
+subj=
 
 # ---------------------------------------------------------- self-test, list
 collect <<EOF
@@ -161,7 +202,46 @@ notes=
 note() { notes=$notes$*'
 '; }
 
-echo "trust-audit $VERSION - list of $nlist fingerprints (generated ${gendate:-unknown})"
+# Roots of the public root programs. Needed (and checked) only when unknown roots are reported:
+# a missing or damaged list must not turn every certificate into an "unknown" - nor hide one.
+#   known-roots.tsv        required   sha256 TAB programs TAB label     (update-list, CCADB)
+#   known-roots-extra.tsv  optional   sha256 TAB stores TAB label       (update-list --extras)
+#   known-roots.local.tsv  optional   sha256 [TAB label [TAB why]]      (yours, never shipped)
+KNOWNFILES=
+check_known() { # FILE MINFIELDS -> number of entries, or exit 2
+  awk -F'\t' -v min="$2" '
+    /^#/ || /^[ \t]*$/ { next }
+    { fp = toupper($1) }
+    NF < min || length(fp) != 64 || fp ~ /[^0-9A-F]/ {
+      printf "trust-audit: %s: line %d is malformed (expected a SHA-256 in hex, then TAB-separated fields)\n", FILENAME, NR > "/dev/stderr"; bad = 1; exit }
+    { n++ }
+    END { if (bad) exit 1; print n + 0 }' "$1" || exit 2
+}
+nknown=0 knownage=
+case ",$KINDS," in
+  *,unknown,*)
+    [ -r "$KNOWN" ] || die "cannot read the list of known roots: $KNOWN (or leave out unknown with -k)"
+    nknown=$(check_known "$KNOWN" 3) || exit 2
+    [ "$nknown" -gt 0 ] || die "$KNOWN holds no root"
+    KNOWNFILES=$KNOWN
+    knownage=$(sed -n 's/^# generated=[0-9-]* epoch=\([0-9]*\).*/\1/p' "$KNOWN" | head -n 1)
+    if [ -r "$EXTRA" ]; then
+      nextra=$(check_known "$EXTRA" 3) || exit 2
+      nknown=$((nknown + nextra))
+      KNOWNFILES="$KNOWNFILES$TAB$EXTRA"
+    else
+      note "known-roots-extra.tsv is missing: roots some platforms ship outside the CCADB (Apple's own, Android, Java) will show as unknown"
+    fi
+    if [ -e "$LOCAL" ]; then
+      [ -r "$LOCAL" ] || die "cannot read $LOCAL"
+      nlocal=$(check_known "$LOCAL" 1) || exit 2
+      nknown=$((nknown + nlocal))
+      KNOWNFILES="$KNOWNFILES$TAB$LOCAL"
+      note "$nlocal of your own roots accepted from $LOCAL"
+    fi ;;
+esac
+
+echo "trust-audit $VERSION - lists of ${gendate:-unknown}: $nlist distrusted fingerprints${KNOWNFILES:+, $nknown known roots}"
 if [ -z "$epoch" ]; then
   note "the fingerprint list carries no date: cannot tell how stale it is"
 else
@@ -169,17 +249,26 @@ else
   [ "$age" -gt $((STALE_DAYS * 86400)) ] &&
     note "the fingerprint list is $((age / 86400)) days old: refresh it (update-list) and re-run"
 fi
+if [ -n "$knownage" ]; then
+  age=$(($(date +%s) - knownage))
+  [ "$age" -gt $((STALE_DAYS * 86400)) ] &&
+    note "the list of known roots is $((age / 86400)) days old: a root added since then shows as unknown; refresh it (update-list)"
+fi
 
 # ------------------------------------------------------------------ checking
-found=0 incomplete=0 nstores=0 nhits=0 sigs='' paths='' filesums=''
+incomplete=0 nstores=0 nhits=0 sigs='' paths='' filesums=''
 
 # Results are collected, then printed together at the end (see "report output").
 #   rows      one line per store: STATUS TAB name TAB certificates TAB note
 #   findings  one line per listed certificate found in a store: fingerprint TAB kind TAB store
 #   xnote     extra note for the next row (set by the scanners)
-rows='' findings='' xnote=''
+#   role      what kind of store the scanners are reading: sys (the operating system's own bundle
+#             or directory), apple (Apple's system roots keychain), other. It decides the advice.
+#   exempt    fingerprints of the current store that are not trust anchors (NSS entries without
+#             CA trust): never reported as unknown
+rows='' findings='' xnote='' role=other exempt=''
 row() { # STATUS NAME COUNT NOTE
-  rows="$rows$1$TAB$2$TAB$3$TAB$4
+  rows="$rows$1$TAB$2$TAB$3$TAB$4$TAB$role
 "
 }
 
@@ -207,16 +296,24 @@ report() {
   esac
   nstores=$((nstores + 1))
   sigs="$sigs|$sig=$name|"
-  hits=$(printf '%s\n' "$fps" | awk -F'\t' -v kinds=",$KINDS," '
-    FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF == 5 && index(kinds, "," $2 ",")) kind[$1] = $2; next }
-    $0 in kind { print $0 "\t" kind[$0] }' "$LIST" -) ||
-    { row WARN "$name" "$nblocks" "internal error while checking against the list"; incomplete=1; return; }
+  # A listed fingerprint takes its kind (even when -k leaves that kind out, it is then not
+  # "unknown"); otherwise, one that no known-roots file holds is unknown.
+  hits=$(printf '%s\n' "$fps" | awk -F'\t' -v kinds=",$KINDS," -v exempt=" $exempt " -v kf="$KNOWNFILES" '
+    BEGIN { n = split(kf, k, "\t")
+            for (i = 1; i <= n; i++) {
+              while ((r = (getline line < k[i])) > 0) if (line !~ /^#/) { split(line, f, "\t"); known[toupper(f[1])] = 1 }
+              if (r < 0) exit 1
+              close(k[i]) } }
+    FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF == 5) kind[$1] = $2; next }
+    $0 == "" { next }
+    $0 in kind { if (index(kinds, "," kind[$0] ",")) print $0 "\t" kind[$0]; next }
+    index(kinds, ",unknown,") && !($0 in known) && !index(exempt, " " $0 " ") { print $0 "\tunknown" }' "$LIST" -) ||
+    { row WARN "$name" "$nblocks" "internal error while checking against the lists"; incomplete=1; return; }
   if [ -n "$hits" ]; then
-    found=1 nhits=$((nhits + 1))
-    nh=$(printf '%s\n' "$hits" | awk 'END { print NR }')
+    nhits=$((nhits + 1))
     findings="$findings$(printf '%s\n' "$hits" | awk -F'\t' -v s="$name" -v t="$TAB" '{ print $1 t $2 t s }')
 "
-    row FOUND "$name" "$nblocks" "$nh listed${note:+; $note}"
+    row FOUND "$name" "$nblocks" "$note"
   elif [ "$warn" = 1 ]; then
     row WARN "$name" "$nblocks" "$note"
   else
@@ -350,6 +447,20 @@ scan_jks() {
     awk 'length($0) == 64 && $0 !~ /[^0-9A-F]/' | sort -u)
   nfps=$(printf '%s\n' "$fps" | awk 'NF { n++ } END { print n + 0 }')
   nblocks=$(printf '%s\n' "$out" | awk '/^Alias name:/ { n++ } END { print n + 0 }')
+  subj=$subj$(printf '%s\n' "$out" | awk -v t="$TAB" '
+    function flush() { if (f != "") { if (names == "") names = cn; print f t o t ca t names }; f = ""; o = ""; cn = ""; names = ""; ca = 1; nx = "" }
+    BEGIN { ca = 1 }
+    /^Alias name:/ { flush(); next }
+    /^Owner:/ { o = $0; sub(/^Owner:[ \t]*/, "", o); gsub(/\t/, " ", o)
+                c = o; if (sub(/.*CN=/, "", c)) { sub(/,.*/, "", c); cn = c }; next }
+    /^[ \t]*SHA256:/ { f = $2; gsub(/:/, "", f); f = toupper(f); next }
+    /BasicConstraints:\[/ { nx = "bc"; next }
+    nx == "bc" && /CA:false/ { ca = 0 }
+    /SubjectAlternativeName \[/ { nx = "san"; next }
+    nx == "san" && /DNSName:/ { d = $0; sub(/.*DNSName:[ \t]*/, "", d); sp = names == "" ? "" : " "; names = names sp d; next }
+    /^\]/ { nx = "" }
+    END { flush() }')'
+'
   nfiles=1 nnopem=0
   report "$1 (Java keystore)"
 }
@@ -376,22 +487,35 @@ scan_nss() {
   esac
   nrows=$(printf '%s\n' "$nrows" | awk '/Trust Attributes[ \t]*$/ { h = 1; next } h == 1 { h = 2; next } h == 2 && NF { print }')
   if [ -z "$nrows" ]; then row ok "$label" 0 "empty"; return 0; fi
-  pem='' bad=0
+  # The last column holds the trust flags (SSL,S/MIME,JAR/XPI). An entry without C or T (trusted
+  # CA) is not a trust anchor - a cached intermediate, a user certificate: never "unknown".
+  pem='' plain='' bad=0
   while IFS= read -r nrow; do
     nick=$(printf '%s\n' "$nrow" | sed 's/[[:space:]]*$//; s/[[:space:]][[:space:]]*[A-Za-z,]*$//')
     [ -n "$nick" ] || { bad=1; continue; }
     one=$(certutil -L -d "$spec" -n "$nick" -a 2>/dev/null) || { bad=1; continue; }
     pem="$pem$one
 "
+    flags=$(printf '%s\n' "$nrow" | sed 's/[[:space:]]*$//; s/.*[[:space:]]//')
+    case $flags in *[CT]*) ;; *) plain="$plain$one
+" ;; esac
   done <<EOF
 $nrows
 EOF
   [ "$bad" -eq 0 ] || { not_scanned "$label" "some certificates could not be exported"; return 0; }
-  collect <<EOF || { not_scanned "$label" "read error"; return 0; }
+  exempt=
+  if [ -n "$plain" ]; then
+    collect <<EOF || { not_scanned "$label" "read error"; return 0; }
+$plain
+EOF
+    exempt=$(printf '%s\n' "$fps" | tr '\n' ' ')
+  fi
+  collect <<EOF || { exempt=; not_scanned "$label" "read error"; return 0; }
 $pem
 EOF
   nfiles=1 nnopem=0
   report "$label"
+  exempt=
 }
 
 # find_bundles DIR: well-known bundle file names anywhere under DIR (no symlink following).
@@ -418,12 +542,15 @@ known() { # PREFIX
     /opt/homebrew/etc/openssl@3/cert.pem /opt/homebrew/etc/ca-certificates/cert.pem \
     /opt/local/etc/openssl/cert.pem /opt/local/share/curl/curl-ca-bundle.crt \
     /mingw64/etc/ssl/certs/ca-bundle.crt; do
-    scan_file "$p$f"
+    role=sys; scan_file "$p$f"; role=other
   done
+  for d in /etc/ssl/certs /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts; do
+    role=sys; scan_dir "$p$d"; role=other
+  done
+  # where administrators and users add their own CAs
   for d in \
-    /etc/ssl/certs /usr/local/share/ca-certificates /etc/pki/ca-trust/source/anchors \
-    /etc/pki/trust/anchors /etc/ca-certificates/trust-source/anchors \
-    /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts /data/misc/user/0/cacerts-added; do
+    /usr/local/share/ca-certificates /etc/pki/ca-trust/source/anchors \
+    /etc/pki/trust/anchors /etc/ca-certificates/trust-source/anchors /data/misc/user/0/cacerts-added; do
     scan_dir "$p$d"
   done
   scan_nss "$p/etc/pki/nssdb"
@@ -516,7 +643,9 @@ EOF
 $kcpem
 EOF
       then
+        case $kc in /System/*) role=apple ;; esac
         report "keychain $kc (presence only: trust settings not evaluated)"
+        role=other
       else
         not_scanned "$kc" "security command failed or returned no certificate"
       fi
@@ -554,81 +683,238 @@ if [ "$nstores" -eq 0 ] && [ "$incomplete" -eq 0 ]; then
   exit 2
 fi
 
+
 # ------------------------------------------------------------- report output
+# Everything collected above goes to one awk program as typed records:
+#   R status name count note role   one per store row      F fingerprint kind store   one per finding
+#   S fingerprint subject ca names                         N note                     M incomplete stores
+# It prints the report, organised by what to do, and exits with the status.
 if [ "$COLOR" = 1 ]; then
   B="${ESC}[1m" D="${ESC}[2m" R="${ESC}[31m" Y="${ESC}[33m" G="${ESC}[32m" N="${ESC}[0m"
 else
   B='' D='' R='' Y='' G='' N=''
 fi
 
-echo
-printf '%s\n' "$rows" | awk -F'\t' -v quiet="$QUIET" -v B="$B" -v D="$D" -v R="$R" -v Y="$Y" -v G="$G" -v N="$N" '
-  NF { n++; st[n] = $1; nm[n] = $2; ct[n] = $3; nt[n] = $4; if (length($2) > w) w = length($2) }
+# This machine's own names: a self-signed non-CA certificate naming only them (ssl-cert's
+# "snakeoil", generated at install) can vouch for nothing but this host.
+if [ "$ROOTMODE" = 1 ]; then hosts=$(cat "$ROOT/etc/hostname" 2>/dev/null)
+else hosts="$(uname -n 2>/dev/null) $(cat /etc/hostname 2>/dev/null)"; fi
+hosts=$(printf 'localhost %s\n' "$hosts" | awk '{ for (i = 1; i <= NF; i++) { h = tolower($i); print h; sub(/\..*/, "", h); print h } }' | sort -u | tr '\n' ' ')
+
+{
+  printf '%s' "$rows" | awk 'NF { print "R\t" $0 }'
+  printf '%s' "$findings" | awk 'NF { print "F\t" $0 }'
+  printf '%s' "$subj" | awk 'NF { print "S\t" $0 }'
+  printf '%s' "$notes" | awk 'NF { print "N\t" $0 }'
+  printf 'M\t%s\t%s\n' "$incomplete" "$nstores"
+} | awk -F'\t' -v quiet="$QUIET" -v verbose="$VERBOSE" -v local_file="$LOCAL" -v hosts=" $hosts " \
+  -v B="$B" -v D="$D" -v R="$R" -v Y="$Y" -v G="$G" -v N="$N" '
+  FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF == 5) { lbl[$1] = $3; why[$1] = $4; ref[$1] = $5 } next }
+
+  $1 == "R" { nr++; st[nr] = $2; nm[nr] = $3; ct[nr] = $4; nt[nr] = $5; role[$3] = $6
+              if (length($3) > w) w = length($3)
+              if ($6 == "sys" && $2 != "SKIP") hassys = 1
+              next }
+  $1 == "F" { fp = $2; s = $4
+              if (!(fp in kind)) { kind[fp] = $3; order[++nf] = fp }
+              if (!((fp, s) in seen)) { seen[fp, s] = 1; ns[fp]++; stores[fp, ns[fp]] = s }
+              if (role[s] == "sys") insys[fp] = 1
+              next }
+  $1 == "S" { if (!($2 in subject) && $3 != "") { subject[$2] = $3; isca[$2] = $4; dns[$2] = $5 }; next }
+  $1 == "N" { notes[++nn] = $2; next }
+  $1 == "M" { incomplete = $2; nstores = $3; next }
+
+  function name(fp) { return fp in lbl ? lbl[fp] : (fp in subject ? subject[fp] : "(subject not read)") }
+  function where(fp,   j, s, sp) { s = ""; for (j = 1; j <= ns[fp]; j++) { sp = j > 1 ? ", " : ""; s = s sp stores[fp, j] }; return s }
+  function inlines(fp,   j) { for (j = 1; j <= ns[fp]; j++) printf "      %s %s\n", (j == 1 ? "in    " : "      "), stores[fp, j] }
+  function refs(fp,   j, nr2, rr) { nr2 = split(ref[fp], rr, " "); for (j = 1; j <= nr2; j++) printf "      ref    %s\n", rr[j] }
+  function plural(n, one, many) { return n " " (n == 1 ? one : many) }
+  # print TEXT word-wrapped at 96 columns: FIRST before the first line, PAD before the others
+  function wrap(first, text, pad,   a, j, m, line, sp) {
+    m = split(text, a, " "); line = first
+    for (j = 1; j <= m; j++) {
+      if (length(line) + length(a[j]) + 1 > 96 && line != first && line != pad) { print line; line = pad }
+      sp = (line == first || line == pad) ? "" : " "; line = line sp a[j]
+    }
+    print line
+  }
+  # true when every name the certificate is valid for is one of this machine'"'"'s own names
+  function ownhost(fp,   a, j, m) {
+    m = split(tolower(dns[fp]), a, " "); if (m == 0) return 0
+    for (j = 1; j <= m; j++) if (!index(hosts, " " a[j] " ")) return 0
+    return 1
+  }
+  function scope(fp) { return isca[fp] == "0" ? "not a CA: trusted only for " (dns[fp] == "" ? "(no name)" : dns[fp]) : "" }
+  # A list of certificate names: the first three, then a count (all of them with -v).
+  function names(list, n,   a, j, s, m, sp) {
+    m = split(list, a, " "); s = ""
+    for (j = 1; j <= m; j++) {
+      if (!verbose && j > 3) { s = s ", ... (+" (m - 3) ", -v lists them)"; break }
+      sp = j > 1 ? ", " : ""; s = s sp name(a[j])
+    }
+    return s
+  }
   END {
+    # ---- sort the findings by what to do
+    for (i = 1; i <= nf; i++) {
+      fp = order[i]; k = kind[fp]
+      if (k == "unknown") {
+        if (isca[fp] == "0" && ownhost(fp)) { ol = ol " " fp; nown++ } else ul[++nu] = fp
+        continue
+      }
+      if (k == "compromised") { cl[++ncomp] = fp; continue }
+      if (k == "partial") { pl = pl " " fp; npart++; continue }
+      for (j = 1; j <= ns[fp]; j++) {          # removed: per store
+        s = stores[fp, j]
+        if (role[s] == "apple") { if (!(fp in ap)) { ap[fp] = 1; al = al " " fp; napple++ } continue }
+        if (!(s in upd)) { upd[s] = ""; nupd++ }
+        upd[s] = upd[s] " " fp; updn[s]++
+        if (hassys && role[s] != "sys" && !(fp in insys)) behind[s]++
+      }
+    }
+    ninfo = npart + napple + nown
+    # stores of the same kind holding the same roots (a bundle and its directory) are one item
+    for (i = 1; i <= nr; i++) {
+      s = nm[i]
+      if (!(s in upd) || (s in done)) continue
+      done[s] = 1; key = upd[s] SUBSEP role[s]
+      if (key in first) { also[first[key]] = also[first[key]] ", " s; skip[s] = 1 } else { first[key] = s; nitems++ }
+    }
+    # per store: listed and unknown certificates (this machine'"'"'s own certificate is not unknown)
+    for (i = 1; i <= nf; i++) {
+      fp = order[i]
+      for (j = 1; j <= ns[fp]; j++) {
+        s = stores[fp, j]
+        if (kind[fp] != "unknown") lc[s]++
+        else if (!(isca[fp] == "0" && ownhost(fp))) uc[s]++
+      }
+    }
+
+    # ---- verdict
+    parts = ""
+    if (nu) parts = plural(nu, "unknown certificate", "unknown certificates")
+    sp = parts == "" ? "" : ", "
+    if (ncomp) { parts = parts sp ncomp " compromised"; sp = ", " }
+    if (nupd) parts = parts sp plural(nitems, "store", "stores") " to update"
+    rd = incomplete ? "; some stores could not be read, see [SKIP]/[WARN]" : ""
+    if (nu || ncomp) { col = R; verdict = "ACT NOW - " parts rd; rc = 1 }
+    else if (nupd) { col = Y; verdict = "UPDATE NEEDED - " parts rd; rc = 1 }
+    else if (incomplete) { col = Y; verdict = "INCOMPLETE - nothing found in what could be read, but see the [SKIP]/[WARN] lines: this is NOT a clean result"; rc = 3 }
+    else { col = G; verdict = "NOTHING TO DO - " plural(nstores, "store", "stores") " read" (ninfo ? ", " ninfo " finding(s) for information only" : ", none holds a listed or unknown certificate"); rc = 0 }
+    print ""
+    print col B "VERDICT: " verdict N
+
+    # ---- unknown certificate authorities
+    if (nu) {
+      print ""
+      print R B "UNKNOWN" N " - " plural(nu, "certificate", "certificates") " that no public root program trusts"
+      if (!quiet) {
+        print "  No public root program (Apple, Chrome, Microsoft, Mozilla, nor the Android and Java"
+        print "  stores) includes these: they were added to this machine. Roots recorded in"
+        print "  " local_file " are not reported."
+      }
+      for (i = 1; i <= nu; i++) {
+        fp = ul[i]
+        if (quiet) { printf "  %sUNKNOWN%s      %s  sha256 %s  (in: %s)\n", R, N, name(fp) (scope(fp) == "" ? "" : " [" scope(fp) "]"), fp, where(fp); continue }
+        printf "\n  %s%s%s\n", B, name(fp), N
+        if (scope(fp) != "") printf "      %s\n", scope(fp)
+        printf "      sha256 %s\n", fp
+        inlines(fp)
+      }
+    }
+
+    # ---- compromised
+    if (ncomp) {
+      print ""
+      print R B "COMPROMISED" N " - " plural(ncomp, "certificate", "certificates") " tied to a stolen key"
+      for (i = 1; i <= ncomp; i++) {
+        fp = cl[i]
+        if (quiet) { printf "  %sCOMPROMISED%s  %s  (in: %s)\n", R, N, name(fp), where(fp); continue }
+        printf "\n  %s%s%s\n", B, name(fp), N
+        wrap("      ", why[fp], "      ")
+        if (verbose) { printf "      sha256 %s\n", fp; refs(fp) }
+        inlines(fp)
+      }
+    }
+
+    # ---- stores to update (in the order they were read)
+    if (nupd) {
+      print ""
+      print Y B "TO UPDATE" N " - " plural(nitems, "store holds", "stores hold") " roots Mozilla removed"
+      for (i = 1; i <= nr; i++) {
+        s = nm[i]
+        if (!(s in upd) || (s in skip) || (s in shown)) continue
+        shown[s] = 1
+        what = plural(updn[s], "root", "roots") " removed by Mozilla"
+        if (behind[s]) what = what ", " behind[s] " of them no longer in your system store"
+        if (role[s] == "sys") what = what " (this is the system store)"
+        if (quiet) { printf "  %sUPDATE%s       %s%s  (%s)\n", Y, N, s, (s in also ? also[s] : ""), what; continue }
+        printf "\n  %s%s%s\n", B, s, N
+        if (s in also) printf "      also   %s\n", substr(also[s], 3)
+        printf "      %s\n", what
+        if (!verbose) { wrap("      roots  ", names(substr(upd[s], 2)), "             "); continue }
+        m = split(substr(upd[s], 2), a, " ")
+        for (j = 1; j <= m; j++) {
+          printf "      - %s\n", name(a[j]); wrap("        ", why[a[j]], "        "); printf "        sha256 %s\n", a[j]
+          if (ref[a[j]] != "") { nr2 = split(ref[a[j]], rr, " "); for (q = 1; q <= nr2; q++) printf "        ref    %s\n", rr[q] }
+        }
+      }
+    }
+
+    # ---- for information
+    if (ninfo) {
+      print ""
+      print D B "FOR INFORMATION" N D " - nothing to do" N
+      if (npart) {
+        if (quiet) printf "  INFO         %s Mozilla distrusts only for certificates issued after a date\n", plural(npart, "root", "roots")
+        else {
+          wrap("  ", plural(npart, "root", "roots") " Mozilla distrusts only for certificates issued after a date (a flat bundle cannot express the date): " names(substr(pl, 2)), "    ")
+          if (verbose) { m = split(substr(pl, 2), a, " "); for (j = 1; j <= m; j++) { printf "\n    %s\n      %s\n      sha256 %s\n", name(a[j]), why[a[j]], a[j]; inlines(a[j]) } }
+        }
+      }
+      if (nown) {
+        if (quiet) printf "  INFO         %s of this machine itself\n", plural(nown, "self-signed certificate", "self-signed certificates")
+        else {
+          wrap("  ", plural(nown, "self-signed certificate", "self-signed certificates") " of this machine itself, valid only for its own name (such as ssl-cert'"'"'s snakeoil): " names(substr(ol, 2)), "    ")
+          if (verbose) { m = split(substr(ol, 2), a, " "); for (j = 1; j <= m; j++) { printf "\n    %s\n      %s\n      sha256 %s\n", name(a[j]), scope(a[j]), a[j]; inlines(a[j]) } }
+        }
+      }
+      if (napple) {
+        if (quiet) printf "  INFO         %s Mozilla removed, still in Apple'"'"'s root program\n", plural(napple, "root", "roots")
+        else {
+          wrap("  ", plural(napple, "root", "roots") " Mozilla removed that Apple still ships in its own root program (the system roots keychain, updated with macOS): " names(substr(al, 2)), "    ")
+        }
+      }
+    }
+
+    # ---- stores
+    print ""
     print B "STORES" N
     tag["FOUND"] = R "[FOUND]" N; tag["ok"] = G "[ ok  ]" N; tag["same"] = D "[same ]" N
     tag["SKIP"] = Y "[SKIP ]" N; tag["WARN"] = Y "[WARN ]" N
-    for (i = 1; i <= n; i++) {
-      if (quiet && (st[i] == "ok" || st[i] == "same")) continue
-      pad = nm[i]; while (length(pad) < w) pad = pad " "
-      printf "  %s  %s  %5s", tag[st[i]], pad, ct[i]
-      if (nt[i] != "") printf "  %s", nt[i]
+    for (i = 1; i <= nr; i++) {
+      s = nm[i]; t = st[i]; c = ""
+      if (lc[s]) c = lc[s] " listed"
+      sp = c == "" ? "" : ", "; if (uc[s]) c = c sp uc[s] " unknown"
+      if (t == "FOUND" && c == "") t = "ok"
+      sp = c == "" ? "" : "; "; if (nt[i] != "") c = c sp nt[i]
+      if (quiet && (t == "ok" || t == "same")) continue
+      pad = s; while (length(pad) < w) pad = pad " "
+      printf "  %s  %s  %5s", tag[t], pad, ct[i]
+      if (c != "") printf "  %s", c
       printf "\n"
     }
-  }'
 
-if [ -n "$findings" ]; then
-  echo
-  printf '%s\n' "$findings" | awk -F'\t' -v quiet="$QUIET" -v B="$B" -v D="$D" -v R="$R" -v Y="$Y" -v N="$N" '
-    FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF == 5) { lbl[$1] = $3; why[$1] = $4; ref[$1] = $5 } next }
-    NF {
-      if (!($1 in kind)) { kind[$1] = $2; order[++nf] = $1 }
-      key = $1 SUBSEP $3
-      if (!(key in seen)) { seen[key] = 1; ns[$1]++; stores[$1, ns[$1]] = $3 }
+    print ""
+    for (i = 1; i <= nn; i++) print "note: " notes[i]
+    if (quiet) print "Not examined: compiled-in stores, browsers'"'"' built-in roots, the Windows store, override settings (see README)."
+    else {
+      print B "NOT EXAMINED" N "  stores compiled into applications (Node.js, Go/Rust programs), the built-in"
+      print "              roots of browsers, the Windows certificate store, and settings that override a"
+      print "              store (macOS trust settings, Java blocked.certs, ...). The README lists"
+      print "              what is covered."
     }
-    END {
-      split("compromised removed partial", ks, " ")
-      line = ""
-      for (r = 1; r <= 3; r++) {
-        c = 0; for (i = 1; i <= nf; i++) if (kind[order[i]] == ks[r]) c++
-        sep = (line == "" ? "" : ", ")
-        if (c) line = line sep c " " ks[r]
-      }
-      print B "FINDINGS" N " - " line
-      col["compromised"] = R; col["removed"] = Y; col["partial"] = D
-      for (r = 1; r <= 3; r++) for (i = 1; i <= nf; i++) {
-        f = order[i]; if (kind[f] != ks[r]) continue
-        K = toupper(kind[f])
-        if (quiet) {
-          s = ""; for (j = 1; j <= ns[f]; j++) { sep = (j > 1 ? ", " : ""); s = s sep stores[f, j] }
-          printf "  %s%-11s%s  %s  (in: %s)\n", col[kind[f]], K, N, lbl[f], s
-          continue
-        }
-        printf "\n  %s%-11s%s  %s%s%s\n", col[kind[f]], K, N, B, lbl[f], N
-        printf "      %s\n      sha256 %s\n", why[f], f
-        nr = split(ref[f], rr, " ")
-        for (j = 1; j <= nr; j++) printf "      ref    %s\n", rr[j]
-        for (j = 1; j <= ns[f]; j++) printf "      %s %s\n", (j == 1 ? "in    " : "      "), stores[f, j]
-      }
-    }' "$LIST" -
-fi
-
-echo
-[ -n "$notes" ] && printf 'note: %s' "$notes"
-if [ "$QUIET" = 1 ]; then
-  echo "Not examined: compiled-in stores, browsers' built-in roots, the Windows store, override settings (see README)."
-else
-  echo "${B}NOT EXAMINED${N}  stores compiled into applications (Node.js, Go/Rust programs), the built-in"
-  echo "              roots of browsers, the Windows certificate store, and settings that override a"
-  echo "              store (macOS trust settings, Java blacklisted.certs, ...). The README lists"
-  echo "              what is covered."
-fi
-if [ "$found" -eq 1 ]; then
-  echo "${R}RESULT: distrusted certificates present in $nhits of $nstores store(s)$([ "$incomplete" -eq 1 ] && echo '; some stores could not be read, see [SKIP]/[WARN] lines')${N}"
-  exit 1
-elif [ "$incomplete" -eq 1 ]; then
-  echo "${Y}RESULT: INCOMPLETE - nothing found in what could be read, but see the [SKIP]/[WARN] lines: this is NOT a clean result${N}"
-  exit 3
-fi
-echo "${G}RESULT: clean - $nstores store(s) read, none holds a listed certificate${N}"
-exit 0
+    if (rc == 1) print "What to do about each item: README.md, section \"What to do\"."
+    print col B "RESULT: " verdict N
+    exit rc
+  }' "$LIST" -
