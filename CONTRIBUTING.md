@@ -5,11 +5,16 @@ weakens one of them will not be merged, however convenient.
 
 - Plain POSIX `sh`; no bashisms in `trust-audit`. It must pass `shellcheck` with no disabled rule
   (`shellcheck trust-audit update-list tests/*.sh`).
+- The output states facts (what was found, where, how many); advice on what to do goes in the
+  README's "What to do" section, not in the output.
 - Every behaviour change comes with a test in `tests/test-trust-audit.sh` using throw-away
-  certificates. Include the *failure* case: what must not be reported clean.
+  certificates. Include the *failure* case: what must not be reported clean. Tests check
+  behaviour - what is detected, counted, classified, the exit status, the errors - not wording.
 - New store location: say which system/package uses it and link its documentation in the pull
   request. A path you could not verify goes in the README's “not tested” list.
-- List changes: run `./update-list`, review the diff, and explain any removal. Curated incidents
+- List changes: run `./update-list` (and `./update-list --extras` when it says the observatory
+  list is behind), review the diff, and explain any removal. Never edit `distrusted.tsv`,
+  `known-roots.tsv` or `known-roots-extra.tsv` by hand: they are generated. Curated incidents
   go in `sources/curated.tsv`, each entry with a
   fingerprint from a published source, a factual one-line reason, and references you have opened
   and checked (one or more URLs, space-separated). Never add a fingerprint from memory.
