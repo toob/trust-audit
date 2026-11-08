@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 - unreleased
+## 0.2.0 - 2026-11-08 (MIT licensed)
 
 Breaking: the report and the exit status are organised around what to do.
 
